@@ -4,7 +4,17 @@ CC=g++ -g -std=c++11
 WFLAGS=-Wall -Wno-char-subscripts -Wno-stringop-truncation -Wno-class-memaccess -Wno-misleading-indentation -Wno-unknown-warning-option -Werror
 LFLAGS=-lm -lpthread
 else
-CC=emcc -g -std=c++11 -D BUILD_WASM -s ERROR_ON_UNDEFINED_SYMBOLS=0 -s EXPORTED_RUNTIME_METHODS=['ccall','UTF8ToString ']  -s  EXPORTED_FUNCTIONS=['_getHash'] -s FORCE_FILESYSTEM=1 -s LLD_REPORT_UNDEFINED -s ERROR_ON_UNDEFINED_SYMBOLS=0 -s DISABLE_EXCEPTION_CATCHING=0 -s ALLOW_MEMORY_GROWTH=1
+CC=emcc -g -std=c++11 -D BUILD_WASM \
+		-s ERROR_ON_UNDEFINED_SYMBOLS=0 \
+		-s EXPORTED_RUNTIME_METHODS=['ccall','FS','UTF8ToString '] \
+		-s EXPORTED_FUNCTIONS=['_getHash'] \
+		-s FORCE_FILESYSTEM=1 \
+		-s ASSERTIONS=1 \
+		-s LLD_REPORT_UNDEFINED \
+		-s DISABLE_EXCEPTION_CATCHING=0 \
+		-s ALLOW_MEMORY_GROWTH=1 \
+		-s EXPORT_ES6=1 \
+		-O1
 WFLAGS=-Wall -Wno-char-subscripts -Werror
 LFLAGS=-lm
 endif

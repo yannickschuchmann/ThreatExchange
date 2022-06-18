@@ -7,6 +7,10 @@ all: check-dependencies build test
 build: check-dependencies
 	@docker pull emscripten/emsdk:3.1.7
 	@docker run --rm -v $(CWD)/../..:/src emscripten/emsdk:3.1.7 emmake make wasm --directory=pdq/cpp
+
+buildOnly: 
+	@docker pull emscripten/emsdk:3.1.7
+	@docker run --rm -v $(CWD)/../..:/src emscripten/emsdk:3.1.7 emmake make wasm --directory=pdq/cpp
 	
 test:
 	@[ -f $(CWD)/../cpp/pdq-photo-hasher.js -a -f $(CWD)/../cpp/pdq-photo-hasher.wasm ] || (echo "Build the web assembly before running test targets"; /bin/false)
