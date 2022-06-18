@@ -6,7 +6,8 @@ The fetcher is the component that talks to external APIs to get and put signals
 @see SignalExchangeAPI
 """
 
-
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 import typing as t
 
 from threatexchange import common
@@ -15,11 +16,17 @@ from threatexchange.signal_type.signal_base import SignalType
 from threatexchange.fetcher import fetch_state as state
 
 TCollabConfig = t.TypeVar("TCollabConfig", bound=CollaborationConfigBase)
-TFetchDelta = t.TypeVar("TFetchDelta", bound=state.FetchDelta)
 
-# TODO t.Generic[TFetchDelta, TFetchedSignalData, TCollabConfig]
-#      In order to make it easier to track the expected extensions for an API
-class SignalExchangeAPI:
+
+class SignalExchangeAPI(
+    t.Generic[
+        TCollabConfig,
+        state.TFetchCheckpoint,
+        state.TFetchedSignalMetadata,
+        state.TUpdateRecord,
+    ],
+    ABC,
+):
     """
     APIs to get and maybe put signals.
 
@@ -67,19 +74,64 @@ class SignalExchangeAPI:
         return common.class_name_to_human_name(name, "Signal")
 
     @classmethod
-    def get_checkpoint_cls(cls) -> t.Type[state.FetchCheckpointBase]:
+    def get_checkpoint_cls(cls) -> t.Type[state.TFetchCheckpoint]:
         """Returns the dataclass used to control checkpoint for this API"""
-        return state.FetchCheckpointBase  # Default = no checkpoints
+        # Default = no checkpoints
+        return state.FetchCheckpointBase  # type: ignore
 
     @classmethod
-    def get_record_cls(cls) -> t.Type[state.FetchedSignalMetadata]:
+    def get_record_cls(cls) -> t.Type[state.TFetchedSignalMetadata]:
         """Returns the dataclass used to store records for this API"""
-        return state.FetchedSignalMetadata  # Default = no metadata
+        # Default = no metadata
+        return state.FetchedSignalMetadata  # type: ignore
 
     @classmethod
-    def get_config_class(cls) -> t.Type[CollaborationConfigBase]:
+    def get_config_class(cls) -> t.Type[TCollabConfig]:
         """Returns the dataclass used to store records for this API"""
-        return CollaborationConfigBase
+        # Default - just knowing the type is enough
+        return CollaborationConfigBase  # type: ignore
+
+    @classmethod
+    @abstractmethod
+    def naive_fetch_merge(
+        cls,
+        old: t.Optional[state.TUpdateRecord],
+        new: state.TUpdateRecord,
+    ) -> state.TUpdateRecord:
+        """
+        Merge a new update produced by fetch in-memory.
+
+        It is safe to merge into `old` in-place if supported, and return that.
+
+        This is the fallback method of creating state when there isn't a
+        specialized storage for the fetch type.
+
+        For example, if you have nothing else, merging NCMEC update records
+        together by ID will eventually get you an entire copy of the database.
+        However, if it started to get too big where it would be a problem to
+        load into memory, it would be better to store in a storage that
+        only let you update the IDs you had updates for, or let you build an
+        index based on other fields inside. If you were doing that, you
+        wouldn't use this and rely on a specialzied implementation for this
+        API that extends FetchStateStore.
+        """
+        raise NotImplementedError
+
+    @classmethod
+    @abstractmethod
+    def naive_convert_to_signal_type(
+        cls,
+        signal_types: t.Sequence[t.Type[SignalType]],
+        fetched: state.TUpdateRecord,
+    ) -> t.Dict[t.Type[SignalType], t.Dict[str, state.TFetchedSignalMetadata]]:
+        """
+        Convert the record from the API format to the format needed for indexing.
+
+        This is the fallback method of creating state when there isn't a
+        specialized storage for the fetch type.
+
+        """
+        raise NotImplementedError
 
     # TODO - this doens't work for StopNCII which sends the owner as a string
     #        maybe this should take the full metadata?
@@ -91,7 +143,7 @@ class SignalExchangeAPI:
         """
         return ""
 
-    def get_own_owner_id(self, collab: CollaborationConfigBase) -> int:
+    def get_own_owner_id(self, collab: TCollabConfig) -> int:
         """
         Return the owner ID of this caller. Opinions with that ID are "ours".
 
@@ -105,31 +157,37 @@ class SignalExchangeAPI:
         """
         return -1
 
-    def fetch_once(
+    @abstractmethod
+    def fetch_iter(
         self,
-        supported_signal_types: t.List[t.Type[SignalType]],
-        collab: CollaborationConfigBase,
+        supported_signal_types: t.Sequence[t.Type[SignalType]],
+        collab: TCollabConfig,
         # None if fetching for the first time,
         # otherwise the previous FetchDelta returned
-        checkpoint: t.Optional[state.FetchCheckpointBase],
-    ) -> state.FetchDelta[state.FetchCheckpointBase]:
+        checkpoint: t.Optional[state.TFetchCheckpoint],
+    ) -> t.Iterator[state.FetchDelta[state.TUpdateRecord, state.TFetchCheckpoint]]:
         """
-        Call out to external resources, pulling down one "batch" of content.
+        Call out to external resources, fetching a batch of updates per yield.
 
         Many APIs are a sequence of events: (creates/updates, deletions)
         In that case, it's important the these events are strictly ordered.
         I.e. if the sequence is create => delete, if the sequence is reversed
         to delete => create, the end result is a stored record, when the
         expected is a deleted one.
+
+        The iterator may be abandoned before it is completely exhausted.
+
+        If the iterator returns, it should be because there is no more data
+        (i.e. the fetch is up to date).
         """
         raise NotImplementedError
 
     def report_seen(
         self,
-        collab: CollaborationConfigBase,
+        collab: TCollabConfig,
         s_type: SignalType,
         signal: str,
-        metadata: state.FetchedStateStoreBase,
+        metadata: state.TFetchedSignalMetadata,
     ) -> None:
         """
         Report that you observed this signal.
@@ -141,7 +199,7 @@ class SignalExchangeAPI:
 
     def report_opinion(
         self,
-        collab: CollaborationConfigBase,
+        collab: TCollabConfig,
         s_type: t.Type[SignalType],
         signal: str,
         opinion: state.SignalOpinion,
@@ -159,10 +217,10 @@ class SignalExchangeAPI:
 
     def report_true_positive(
         self,
-        collab: CollaborationConfigBase,
+        collab: TCollabConfig,
         s_type: t.Type[SignalType],
         signal: str,
-        metadata: state.FetchedSignalMetadata,
+        metadata: state.TFetchedSignalMetadata,
     ) -> None:
         """
         Report that a previously seen signal was a true positive.
@@ -183,10 +241,10 @@ class SignalExchangeAPI:
 
     def report_false_positive(
         self,
-        collab: CollaborationConfigBase,
+        collab: TCollabConfig,
         s_type: t.Type[SignalType],
         signal: str,
-        metadata: state.FetchedSignalMetadata,
+        metadata: state.TFetchedSignalMetadata,
     ) -> None:
         """
         Report that a previously seen signal is a false positive.
@@ -206,56 +264,83 @@ class SignalExchangeAPI:
         )
 
 
-class SignalExchangeAPIWithIterFetch(
-    t.Generic[
-        state.TFetchCheckpoint
-    ],  # TODO move to SignalExchangeAPI in a future diff
-    SignalExchangeAPI,
+# A convenience helper since mypy can't intuit that bound != t.Any
+# For methods like get_checkpoint_cls
+TSignalExchangeAPI = SignalExchangeAPI[
+    CollaborationConfigBase,
+    state.FetchCheckpointBase,
+    state.FetchedSignalMetadata,
+    t.Any,
+]
+
+TSignalExchangeAPICls = t.Type[TSignalExchangeAPI]
+
+
+K = t.TypeVar("K")
+V = t.TypeVar("V")
+
+
+class SignalExchangeAPIWithKeyedUpdates(
+    SignalExchangeAPI[
+        TCollabConfig,
+        state.TFetchCheckpoint,
+        state.TFetchedSignalMetadata,
+        t.Dict[K, t.Optional[V]],
+    ]
 ):
     """
-    Provides an alternative fetch_once implementation to simplify state
+    An API that supports sequential updates with a common key (id, hash, etc).
 
-    @see fetch_iter
+    This provides a simple approach for merging data.
+    A value of None for a value indicates that the record was deleted.
     """
 
-    def __init__(self) -> None:
-        self._fetch_iters: t.Dict[
-            str, t.Iterator[state.FetchDelta[state.TFetchCheckpoint]]
-        ] = {}
+    @classmethod
+    def naive_fetch_merge(
+        cls, old: t.Optional[t.Dict[K, t.Optional[V]]], new: t.Dict[K, t.Optional[V]]
+    ) -> t.Dict[K, t.Optional[V]]:
+        old = old or {}
+        for k, v in new.items():
+            if v is None:
+                old.pop(k, None)
+            else:
+                old[k] = v
+        return old
 
-    def fetch_once(  # type: ignore[override]  # fix with generics on base
-        self,
-        supported_signal_types: t.List[t.Type[SignalType]],
-        collab: CollaborationConfigBase,
-        # None if fetching for the first time,
-        # otherwise the previous FetchDelta returned
-        checkpoint: t.Optional[state.TFetchCheckpoint],
-    ) -> state.FetchDelta[state.TFetchCheckpoint]:
-        it = self._fetch_iters.get(collab.name)
-        if it is None:
-            it = self.fetch_iter(supported_signal_types, collab, checkpoint)
-            self._fetch_iters[collab.name] = it
-        delta = next(it, None)
-        # This can happen if the last yielded element did not set done
-        # which will cause next() to be called again after the iterator
-        # is exhaused
-        assert delta is not None, "fetch_iter stopping yielding too early"
-        return delta
 
-    def fetch_iter(
-        self,
-        supported_signal_types: t.List[t.Type[SignalType]],
-        collab: CollaborationConfigBase,
-        # None if fetching for the first time,
-        # otherwise the previous FetchDelta returned
-        checkpoint: t.Optional[state.TFetchCheckpoint],
-    ) -> t.Iterator[state.FetchDelta[state.TFetchCheckpoint]]:
-        """
-        An alternative to fetch_once implementation to simplify state.
+class SignalExchangeAPIWithSimpleUpdates(
+    SignalExchangeAPIWithKeyedUpdates[
+        TCollabConfig,
+        state.TFetchCheckpoint,
+        state.TFetchedSignalMetadata,
+        t.Tuple[str, str],
+        state.TFetchedSignalMetadata,
+    ]
+):
+    """
+    An API that conveniently maps directly into the form needed by index.
 
-        Since we expect fetch_once to be called sequentially, we can safely
-        store things like next_page takens in the implementation.
+    If the API supports returning exactly the hashes and all the metadata needed
+    to make a decision on the hash without needing an indirection of ID (for example,
+    to support deletes), then you can choose to directly return it in a form that
+    maps directly into SignalType.
+    """
 
-        TODO: This seems straight up better than fetch_once, refactor out
-        """
-        raise NotImplementedError
+    @classmethod
+    def naive_convert_to_signal_type(
+        cls,
+        signal_types: t.Sequence[t.Type[SignalType]],
+        fetched: t.Dict[t.Tuple[str, str], t.Optional[state.TFetchedSignalMetadata]],
+    ) -> t.Dict[t.Type[SignalType], t.Dict[str, state.TFetchedSignalMetadata]]:
+        ret: t.Dict[t.Type[SignalType], t.Dict[str, state.TFetchedSignalMetadata]] = {}
+        type_by_name = {st.get_name(): st for st in signal_types}
+        for (type_str, signal_str), metadata in fetched.items():
+            s_type = type_by_name.get(type_str)
+            if s_type is None or metadata is None:
+                continue
+            inner = ret.get(s_type)
+            if inner is None:
+                inner = {}
+                ret[s_type] = inner
+            inner[signal_str] = metadata
+        return ret

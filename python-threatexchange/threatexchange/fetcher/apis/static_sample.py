@@ -1,33 +1,38 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
 """
-The fetcher is the component that talks to external APIs to get and put signals
+Returns the hardcoded example signals from SignalType implementations.
 
-@see SignalExchangeAPI
+This makes it easier to demonstrate new signal types locally, even without
+access to any API.
+
+The CLI defaults to this being the only collaboration.
 """
 
 
 import typing as t
 
-from threatexchange.signal_type.pdq import PdqSignal
-from threatexchange.signal_type.pdq_ocr import PdqOcrSignal
-from threatexchange.signal_type.md5 import VideoMD5Signal
-from threatexchange.signal_type.raw_text import RawTextSignal
 from threatexchange.signal_type.signal_base import SignalType
-from threatexchange.signal_type.url import URLSignal
-from threatexchange.signal_type.trend_query import TrendQuery, TrendQuerySignal
 
 from threatexchange.fetcher import fetch_state as state
 from threatexchange.fetcher.collab_config import CollaborationConfigBase
-from threatexchange.fetcher.fetch_api import SignalExchangeAPI
-
-from threatexchange.fetcher.simple.state import (
-    SimpleFetchDelta,
-    SimpleFetchedSignalMetadata,
+from threatexchange.fetcher.fetch_api import (
+    SignalExchangeAPIWithSimpleUpdates,
 )
 
+_TypedDelta = state.FetchDelta[
+    t.Dict[t.Tuple[str, str], t.Optional[state.FetchedSignalMetadata]],
+    state.FetchCheckpointBase,
+]
 
-class StaticSampleSignalExchangeAPI(SignalExchangeAPI):
+
+class StaticSampleSignalExchangeAPI(
+    SignalExchangeAPIWithSimpleUpdates[
+        CollaborationConfigBase,
+        state.FetchCheckpointBase,
+        state.FetchedSignalMetadata,
+    ]
+):
     """
     Return a static set of sample data for demonstration.
     """
@@ -36,23 +41,27 @@ class StaticSampleSignalExchangeAPI(SignalExchangeAPI):
     def get_name(cls) -> str:
         return "sample"
 
-    def fetch_once(
+    def fetch_iter(
         self,
-        supported_signal_types: t.List[t.Type[SignalType]],
+        supported_signal_types: t.Sequence[t.Type[SignalType]],
         collab: CollaborationConfigBase,
-        _checkpoint: t.Optional[state.FetchCheckpointBase],
-    ) -> SimpleFetchDelta:
-
+        # None if fetching for the first time,
+        # otherwise the previous FetchDelta returned
+        checkpoint: t.Optional[state.TFetchCheckpoint],
+    ) -> t.Iterator[_TypedDelta]:
         sample_signals: t.List[
             t.Tuple[t.Tuple[str, str], state.FetchedSignalMetadata]
         ] = []
         for stype in supported_signal_types:
             sample_signals.extend(_signals(stype))
 
-        return SimpleFetchDelta(
-            dict(sample_signals),
+        updates: t.Dict[
+            t.Tuple[str, str], t.Optional[state.FetchedSignalMetadata]
+        ] = dict(sample_signals)
+
+        yield _TypedDelta(
+            updates,
             state.FetchCheckpointBase(),
-            done=True,
         )
 
 

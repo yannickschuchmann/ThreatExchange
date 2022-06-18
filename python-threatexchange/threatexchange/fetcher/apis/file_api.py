@@ -1,9 +1,10 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
 """
-The fetcher is the component that talks to external APIs to get and put signals
+A solution that allows loading signals directly from a file.
 
-@see SignalExchangeAPI
+This is useful if you don't have access to an API, but still have a list of 
+hashes from somewhere.
 """
 
 
@@ -11,14 +12,18 @@ import os
 import typing as t
 from dataclasses import dataclass
 from pathlib import Path
-from threatexchange.fetcher.simple.state import (
-    SimpleFetchDelta,
-)
 
 from threatexchange.fetcher import fetch_state as state
-from threatexchange.fetcher.fetch_api import SignalExchangeAPI
+from threatexchange.fetcher.fetch_api import (
+    SignalExchangeAPIWithSimpleUpdates,
+)
 from threatexchange.fetcher.collab_config import CollaborationConfigWithDefaults
 from threatexchange.signal_type.signal_base import SignalType
+
+_TypedDelta = state.FetchDelta[
+    t.Dict[t.Tuple[str, str], t.Optional[state.FetchedSignalMetadata]],
+    state.FetchCheckpointBase,
+]
 
 
 @dataclass
@@ -33,7 +38,13 @@ class FileCollaborationConfig(
     signal_type: t.Optional[str] = None
 
 
-class LocalFileSignalExchangeAPI(SignalExchangeAPI):
+class LocalFileSignalExchangeAPI(
+    SignalExchangeAPIWithSimpleUpdates[
+        FileCollaborationConfig,
+        state.FetchCheckpointBase,
+        state.FetchedSignalMetadata,
+    ]
+):
     """
     Read simple signal files off the local disk.
     """
@@ -42,12 +53,14 @@ class LocalFileSignalExchangeAPI(SignalExchangeAPI):
     def get_config_class(cls) -> t.Type[FileCollaborationConfig]:
         return FileCollaborationConfig
 
-    def fetch_once(  # type: ignore[override]  # fix with generics on base
+    def fetch_iter(
         self,
-        _supported_signal_types: t.List[t.Type[SignalType]],
+        _supported_signal_types: t.Sequence[t.Type[SignalType]],
         collab: FileCollaborationConfig,
-        _checkpoint: t.Optional[state.FetchCheckpointBase],
-    ) -> state.FetchDelta:
+        # None if fetching for the first time,
+        # otherwise the previous FetchDelta returned
+        checkpoint: t.Optional[state.TFetchCheckpoint],
+    ) -> t.Iterator[_TypedDelta]:
         """Fetch the whole file"""
         path = Path(collab.filename)
         assert path.exists(), f"No such file {path}"
@@ -57,7 +70,7 @@ class LocalFileSignalExchangeAPI(SignalExchangeAPI):
         with path.open("r") as f:
             lines = f.readlines()
 
-        updates = {}
+        updates: t.Dict[t.Tuple[str, str], t.Optional[state.FetchedSignalMetadata]] = {}
         for line in lines:
             signal_type = collab.signal_type
             signal = line.strip()
@@ -66,9 +79,9 @@ class LocalFileSignalExchangeAPI(SignalExchangeAPI):
             if signal_type and signal:
                 updates[signal_type, signal] = state.FetchedSignalMetadata()
 
-        return SimpleFetchDelta(updates, state.FetchCheckpointBase(), done=True)
+        yield _TypedDelta(updates, state.FetchCheckpointBase())
 
-    def report_opinion(  # type: ignore[override]  # fix with generics on base
+    def report_opinion(
         self,
         collab: FileCollaborationConfig,
         s_type: t.Type[SignalType],

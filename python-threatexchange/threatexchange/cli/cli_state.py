@@ -10,23 +10,26 @@ There are a few categories of state that this wraps:
   3. Index state - serializations of indexes for SignalType
 """
 
-import json
+import pickle
 import pathlib
 import typing as t
-import dataclasses
 import logging
 
 from threatexchange.signal_type.index import SignalTypeIndex
 from threatexchange.signal_type.signal_base import SignalType
 from threatexchange.cli.exceptions import CommandError
-from threatexchange.cli import dataclass_json
 from threatexchange.fetcher.collab_config import CollaborationConfigBase
 from threatexchange.fetcher.fetch_state import (
     FetchCheckpointBase,
+    FetchDelta,
+    FetchDeltaTyped,
     FetchedSignalMetadata,
 )
 from threatexchange.fetcher.simple import state as simple_state
-from threatexchange.fetcher.fetch_api import SignalExchangeAPI
+from threatexchange.fetcher.fetch_api import (
+    SignalExchangeAPI,
+    SignalExchangeAPIWithSimpleUpdates,
+)
 from threatexchange.signal_type import signal_base
 from threatexchange.signal_type import index
 
@@ -97,9 +100,6 @@ class CliSimpleState(simple_state.SimpleFetchedStateStore):
     but compact enough to handle very large sets of data.
     """
 
-    JSON_CHECKPOINT_KEY = "checkpoint"
-    JSON_RECORDS_KEY = "records"
-
     def __init__(
         self, api_cls: t.Type[SignalExchangeAPI], fetched_state_dir: pathlib.Path
     ) -> None:
@@ -124,37 +124,23 @@ class CliSimpleState(simple_state.SimpleFetchedStateStore):
     def _read_state(
         self,
         collab_name: str,
-    ) -> t.Optional[
-        t.Tuple[
-            t.Dict[str, t.Dict[str, FetchedSignalMetadata]],
-            FetchCheckpointBase,
-        ]
-    ]:
+    ) -> t.Optional[FetchDeltaTyped]:
+
         file = self.collab_file(collab_name)
         if not file.is_file():
             return None
         try:
-            with file.open("r") as f:
-                json_dict = json.load(f)
+            with file.open("rb") as f:
+                delta = pickle.load(f)
 
-            checkpoint = dataclass_json.dataclass_load_dict(
-                json_dict=json_dict[self.JSON_CHECKPOINT_KEY],
-                cls=self.api_cls.get_checkpoint_cls(),
-            )
-            records = json_dict[self.JSON_RECORDS_KEY]
+            assert isinstance(delta, FetchDelta), "Unexpected class type?"
+            delta = t.cast(FetchDeltaTyped, delta)
+            assert (
+                delta.checkpoint.__class__ == self.api_cls.get_checkpoint_cls()
+            ), "wrong checkpoint class?"
 
-            logging.debug("Loaded %s with records for: %s", collab_name, list(records))
-            # Minor stab at lowering memory footprint by converting kinda
-            # inline
-            for stype in list(records):
-                records[stype] = {
-                    signal: dataclass_json.dataclass_load_dict(
-                        json_dict=json_record,
-                        cls=self.api_cls.get_record_cls(),
-                    )
-                    for signal, json_record in records[stype].items()
-                }
-            return records, checkpoint
+            logging.debug("Loaded %s with %d records", collab_name, len(delta.updates))
+            return delta
         except Exception:
             logging.exception("Failed to read state for %s", collab_name)
             raise CommandError(
@@ -162,52 +148,29 @@ class CliSimpleState(simple_state.SimpleFetchedStateStore):
                 "You might have to delete it with `threatexchange fetch --clear`"
             )
 
-    def _write_state(  # type: ignore[override]  # fix with generics on base
+    def _write_state(
         self,
         collab_name: str,
-        updates_by_type: t.Dict[str, t.Dict[str, FetchedSignalMetadata]],
-        checkpoint: FetchCheckpointBase,
+        delta: FetchDeltaTyped,
     ) -> None:
         file = self.collab_file(collab_name)
         if not file.parent.exists():
             file.parent.mkdir(parents=True)
 
-        record_sanity_check = next(
-            (
-                record
-                for records in updates_by_type.values()
-                for record in records.values()
-            ),
-            None,
-        )
-
-        if record_sanity_check is not None:
-            assert (  # Not isinstance - we want exactly this class
-                record_sanity_check.__class__ == self.api_cls.get_record_cls()
-            ), (
-                f"Record cls: want {self.api_cls.get_record_cls().__name__} "
-                f"got {record_sanity_check.__class__.__name__}"
+        if issubclass(self.api_cls, SignalExchangeAPIWithSimpleUpdates):
+            record_sanity_check = next(
+                (record for record in delta.updates.values()),
+                None,
             )
 
-        json_dict = {
-            self.JSON_CHECKPOINT_KEY: dataclasses.asdict(checkpoint),
-            self.JSON_RECORDS_KEY: {
-                stype: {
-                    s: dataclasses.asdict(record)
-                    for s, record in signal_to_record.items()
-                }
-                for stype, signal_to_record in updates_by_type.items()
-            },
-        }
-
+            if record_sanity_check is not None:
+                assert (  # Not isinstance - we want exactly this class
+                    record_sanity_check.__class__ == self.api_cls.get_record_cls()
+                ), (
+                    f"Record cls: want {self.api_cls.get_record_cls().__name__} "
+                    f"got {record_sanity_check.__class__.__name__}"
+                )
         tmpfile = file.with_name(f".{file.name}")
-
-        with tmpfile.open("w") as f:
-            json.dump(json_dict, f, indent=2, default=_json_set_default)
+        with tmpfile.open("wb") as f:
+            pickle.dump(delta, f)
         tmpfile.rename(file)
-
-
-def _json_set_default(obj):
-    if isinstance(obj, set):
-        return list(obj)
-    raise TypeError

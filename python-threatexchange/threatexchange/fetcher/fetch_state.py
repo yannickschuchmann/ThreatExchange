@@ -10,13 +10,16 @@ needed to power API features.
 
 from dataclasses import dataclass
 from enum import IntEnum
-from functools import reduce
+from abc import ABC, abstractmethod
 import typing as t
 
 from threatexchange.fetcher.collab_config import CollaborationConfigBase
 from threatexchange.signal_type.signal_base import SignalType
 
 Self = t.TypeVar("Self")
+
+
+TUpdateRecord = t.TypeVar("TUpdateRecord", bound=t.Sized)
 
 
 @dataclass
@@ -41,6 +44,28 @@ class FetchCheckpointBase:
 TFetchCheckpoint = t.TypeVar("TFetchCheckpoint", bound=FetchCheckpointBase)
 
 
+@dataclass
+class FetchDelta(t.Generic[TUpdateRecord, TFetchCheckpoint]):
+    """
+    Represents an incremental chunk of state fetched from an API.
+
+    The exact storage format may vary by API, and a naive implementation
+    for combining updates to an in-memory state lives in the API, but it
+    often makes sense for a dedicate storage implementation to have a
+    more efficient implementation.
+
+    @see FetchStore
+    """
+
+    updates: TUpdateRecord
+    checkpoint: TFetchCheckpoint
+
+
+FetchDeltaTyped = FetchDelta[
+    t.Any, FetchCheckpointBase
+]  # to anchor checkpoint for typing
+
+
 class SignalOpinionCategory(IntEnum):
     """
     What the opinion on a signal is.
@@ -50,8 +75,11 @@ class SignalOpinionCategory(IntEnum):
     make more sense as a tag
     """
 
+    # TODO: Rename to DOES_NOT_FIT_CATEORY
     FALSE_POSITIVE = 0  # Signal generates false positives
+    # TODO: Rename to something else
     WORTH_INVESTIGATING = 1  # Indirect indicator
+    # TODO: Rename to FITS_CATEGORY
     TRUE_POSITIVE = 2  # Confirmed meets category
 
 
@@ -85,6 +113,7 @@ class AggregateSignalOpinionCategory(IntEnum):
     Keep in Sync with SignalOpinionCategory
     """
 
+    # TODO: Move concept of "my" signals into this
     FALSE_POSITIVE = 0  # Signal generates false positives
     WORTH_INVESTIGATING = 1  # Indirect indicator
     TRUE_POSITIVE = 2  # Confirmed meets category
@@ -155,17 +184,6 @@ class FetchedSignalMetadata:
     def get_as_opinions(self) -> t.List[SignalOpinion]:
         return [SignalOpinion.get_trivial()]
 
-    @classmethod
-    def merge_metadata(cls: t.Type[Self], _older: Self, newer: Self) -> Self:
-        """
-        The merge strategy when tailing a stream of updates.
-
-        Simple strategies might be:
-        1. Replace - newer records for the same signal complete replace old ones
-        2. Merge - new records are combined with old ones
-        """
-        return newer  # Default is replace
-
     def get_as_aggregate_opinion(self) -> AggregateSignalOpinion:
         return AggregateSignalOpinion.from_opinions(self.get_as_opinions())
 
@@ -180,54 +198,9 @@ TFetchedSignalMetadata = t.TypeVar(
     "TFetchedSignalMetadata", bound=FetchedSignalMetadata
 )
 
-
-class FetchDelta(t.Generic[TFetchCheckpoint]):
-    """
-    Contains the result of a fetch.
-
-    You'll need to extend this, but it only to be interpretable by your
-    API's version of FetchedState
-    """
-
-    def record_count(self) -> int:
-        """Helper for --limit"""
-        return 1
-
-    def next_checkpoint(self) -> TFetchCheckpoint:
-        """A serializable checkpoint for fetch."""
-        raise NotImplementedError
-
-    def has_more(self) -> bool:
-        """
-        Returns true if the API has no more data at this time.
-        """
-        raise NotImplementedError
-
-
-class FetchDeltaWithUpdateStream(
-    t.Generic[TFetchCheckpoint, TFetchedSignalMetadata], FetchDelta[TFetchCheckpoint]
-):
-    """
-    For most APIs, they can represented in a simple update stream.
-
-    This allows naive implementations for storage.
-    """
-
-    def get_as_update_dict(
-        self,
-    ) -> t.Mapping[t.Tuple[str, str], t.Optional[TFetchedSignalMetadata]]:
-        """
-        Returns the contents of the delta as
-         (signal_type, signal_str) => record
-        If the record is set to None, this indicates the record should be
-        deleted if it exists.
-        """
-        raise NotImplementedError
-
-
 # TODO t.Generic[TFetchDeltaBase, TFetchedSignalDataBase, FetchCheckpointBase]
 #      to help keep track of the expected subclasses for an impl
-class FetchedStateStoreBase:
+class FetchedStateStoreBase(ABC):
     """
     An interface to previously fetched or persisted state.
 
@@ -243,6 +216,7 @@ class FetchedStateStoreBase:
     since they need to be consistent between instanciation
     """
 
+    @abstractmethod
     def get_checkpoint(
         self, collab: CollaborationConfigBase
     ) -> t.Optional[FetchCheckpointBase]:
@@ -251,6 +225,7 @@ class FetchedStateStoreBase:
         """
         raise NotImplementedError
 
+    @abstractmethod
     def merge(self, collab: CollaborationConfigBase, delta: FetchDelta) -> None:
         """
         Merge a FetchDelta into the state.
@@ -260,6 +235,7 @@ class FetchedStateStoreBase:
         """
         raise NotImplementedError
 
+    @abstractmethod
     def flush(self) -> None:
         """
         Finish writing the results of previous merges to persistant state.
@@ -268,12 +244,14 @@ class FetchedStateStoreBase:
         """
         raise NotImplementedError
 
+    @abstractmethod
     def clear(self, collab: CollaborationConfigBase) -> None:
         """
         Delete all the stored state for this collaboration.
         """
         raise NotImplementedError
 
+    @abstractmethod
     def get_for_signal_type(
         self, collabs: t.List[CollaborationConfigBase], signal_type: t.Type[SignalType]
     ) -> t.Dict[str, t.Dict[str, FetchedSignalMetadata]]:

@@ -12,12 +12,13 @@ import typing as t
 import time
 from dataclasses import dataclass, field
 from threatexchange.fb_threatexchange.threat_updates import ThreatUpdateJSON
-from threatexchange.fetcher.simple.state import SimpleFetchDelta
 
 from threatexchange.fb_threatexchange.api import ThreatExchangeAPI, _CursoredResponse
 
 from threatexchange.fetcher import fetch_state as state
-from threatexchange.fetcher.fetch_api import SignalExchangeAPI
+from threatexchange.fetcher.fetch_api import (
+    SignalExchangeAPIWithSimpleUpdates,
+)
 from threatexchange.fetcher.collab_config import CollaborationConfigWithDefaults
 from threatexchange.signal_type.signal_base import SignalType
 from threatexchange.fetcher.apis.fb_threatexchange_signal import (
@@ -162,12 +163,23 @@ class FBThreatExchangeIndicatorRecord(state.FetchedSignalMetadata):
         )
 
 
-class FBThreatExchangeSignalExchangeAPI(SignalExchangeAPI):
+ThreatExchangeDelta = state.FetchDelta[
+    t.Dict[t.Tuple[str, str], t.Optional[FBThreatExchangeIndicatorRecord]],
+    FBThreatExchangeCheckpoint,
+]
+
+
+class FBThreatExchangeSignalExchangeAPI(
+    SignalExchangeAPIWithSimpleUpdates[
+        FBThreatExchangeCollabConfig,
+        FBThreatExchangeCheckpoint,
+        FBThreatExchangeIndicatorRecord,
+    ]
+):
     def __init__(self, fb_app_token: t.Optional[str] = None) -> None:
         self._api = None
         if fb_app_token is not None:
             self._api = ThreatExchangeAPI(fb_app_token)
-        self.cursors: t.Dict[str, _CursoredResponse] = {}
 
     @property
     def api(self) -> ThreatExchangeAPI:
@@ -180,7 +192,7 @@ class FBThreatExchangeSignalExchangeAPI(SignalExchangeAPI):
         return _API_NAME
 
     @classmethod
-    def get_checkpoint_cls(cls) -> t.Type[state.FetchCheckpointBase]:
+    def get_checkpoint_cls(cls) -> t.Type[FBThreatExchangeCheckpoint]:
         return FBThreatExchangeCheckpoint
 
     @classmethod
@@ -195,64 +207,61 @@ class FBThreatExchangeSignalExchangeAPI(SignalExchangeAPI):
         # TODO -This is supported by the API
         raise NotImplementedError
 
-    def get_own_owner_id(  # type: ignore[override]  # fix with generics on base
-        self, collab: FBThreatExchangeCollabConfig
-    ) -> int:
+    def get_own_owner_id(self, collab: FBThreatExchangeCollabConfig) -> int:
         return self.api.app_id
 
-    def fetch_once(  # type: ignore  # fix with generics on base
+    def fetch_iter(
         self,
-        supported_signal_types: t.List[t.Type[SignalType]],
+        supported_signal_types: t.Sequence[t.Type[SignalType]],
         collab: FBThreatExchangeCollabConfig,
+        # None if fetching for the first time,
+        # otherwise the previous FetchDelta returned
         checkpoint: t.Optional[FBThreatExchangeCheckpoint],
-    ) -> state.FetchDelta:
-        cursor = self.cursors.get(collab.name)
+    ) -> t.Iterator[ThreatExchangeDelta]:
         start_time = None if checkpoint is None else checkpoint.update_time
-        if not cursor:
-            cursor = self.api.get_threat_updates(
-                collab.privacy_group,
-                start_time=start_time,
-                page_size=500,
-                fields=ThreatUpdateJSON.te_threat_updates_fields(),
-                decode_fn=ThreatUpdateJSON,
-            )
-            self.cursors[collab.name] = cursor
+        cursor = self.api.get_threat_updates(
+            collab.privacy_group,
+            start_time=start_time,
+            page_size=500,
+            fields=ThreatUpdateJSON.te_threat_updates_fields(),
+            decode_fn=ThreatUpdateJSON,
+        )
 
         batch: t.List[ThreatUpdateJSON] = []
         highest_time = 0
-        for update in cursor.next():
-            # TODO catch errors here
-            batch.append(update)
-            # Is supposed to be strictly increasing
-            highest_time = max(update.time, highest_time)
+        for fetch in cursor:
+            for update in fetch:
+                # TODO catch errors here
+                batch.append(update)
+                # Is supposed to be strictly increasing
+                highest_time = max(update.time, highest_time)
 
-        # TODO - We can clobber types that map into multiple
-        type_mapping = _make_indicator_type_mapping(supported_signal_types)
-        updates = {}
-        for u in batch:
-            st = type_mapping.get(u.threat_type)
-            if st is not None:
-                updates[
-                    st.get_name(), u.indicator
-                ] = FBThreatExchangeIndicatorRecord.from_threatexchange_json(u)
+            # TODO - We can clobber types that map into multiple
+            type_mapping = _make_indicator_type_mapping(supported_signal_types)
+            updates = {}
+            for u in batch:
+                st = type_mapping.get(u.threat_type)
+                if st is not None:
+                    updates[
+                        st.get_name(), u.indicator
+                    ] = FBThreatExchangeIndicatorRecord.from_threatexchange_json(u)
 
-        return SimpleFetchDelta(
-            updates,
-            FBThreatExchangeCheckpoint(highest_time),
-            done=cursor.done,
-        )
+            yield ThreatExchangeDelta(
+                updates,
+                FBThreatExchangeCheckpoint(highest_time),
+            )
 
-    def report_seen(  # type: ignore[override]  # fix with generics on base
+    def report_seen(
         self,
         collab: FBThreatExchangeCollabConfig,
         s_type: SignalType,
         signal: str,
-        metadata: state.FetchedStateStoreBase,
+        metadata: FBThreatExchangeIndicatorRecord,
     ) -> None:
         # TODO - this is supported by the API
         raise NotImplementedError
 
-    def report_opinion(  # type: ignore[override]  # fix with generics on base
+    def report_opinion(
         self,
         collab: FBThreatExchangeCollabConfig,
         s_type: t.Type[SignalType],
@@ -262,12 +271,12 @@ class FBThreatExchangeSignalExchangeAPI(SignalExchangeAPI):
         # TODO - this is supported by the API
         raise NotImplementedError
 
-    def report_true_positive(  # type: ignore[override]  # fix with generics on base
+    def report_true_positive(
         self,
         collab: FBThreatExchangeCollabConfig,
         s_type: t.Type[SignalType],
         signal: str,
-        metadata: state.FetchedSignalMetadata,
+        metadata: FBThreatExchangeIndicatorRecord,
     ) -> None:
         # TODO - this is supported by the API
         self.report_opinion(
@@ -281,12 +290,12 @@ class FBThreatExchangeSignalExchangeAPI(SignalExchangeAPI):
             ),
         )
 
-    def report_false_positive(  # type: ignore[override]  # fix with generics on base
+    def report_false_positive(
         self,
         collab: FBThreatExchangeCollabConfig,
         s_type: t.Type[SignalType],
         signal: str,
-        _metadata: state.FetchedSignalMetadata,
+        _metadata: FBThreatExchangeIndicatorRecord,
     ) -> None:
         self.report_opinion(
             collab,
@@ -301,7 +310,7 @@ class FBThreatExchangeSignalExchangeAPI(SignalExchangeAPI):
 
 
 def _make_indicator_type_mapping(
-    supported_signal_types: t.List[t.Type[SignalType]],
+    supported_signal_types: t.Sequence[t.Type[SignalType]],
 ) -> t.Dict[str, t.Type[SignalType]]:
     # TODO - We can clobber types that map into multiple
     type_mapping: t.Dict[str, t.Type[SignalType]] = {}
